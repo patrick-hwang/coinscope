@@ -35,13 +35,20 @@ uint8_t get_varint_size(const uint8_t *bytes) {
 	return rv;
 }
 
-void set_address(struct version_packed_net_addr *dest, const struct sockaddr_in &src) {
+void set_address(struct version_packed_net_addr *dest, const struct sockaddr_storage &src) {
 	dest->services = SERVICES;
-	bzero(dest->addr.ipv4.padding, 12);
-	dest->addr.ipv4.padding[10] = 0xFF;
-	dest->addr.ipv4.padding[11] = 0xFF;
-	dest->addr.ipv4.as.number = src.sin_addr.s_addr;
-	dest->port = src.sin_port;
+	bzero(dest, sizeof(*dest) - sizeof(dest->services) - sizeof(dest->port));
+	if (src.ss_family == AF_INET) {
+		const struct sockaddr_in *sin = (const struct sockaddr_in *)&src;
+		dest->addr.ipv4.padding[10] = 0xFF;
+		dest->addr.ipv4.padding[11] = 0xFF;
+		dest->addr.ipv4.as.number = sin->sin_addr.s_addr;
+		dest->port = sin->sin_port;
+	} else if (src.ss_family == AF_INET6) {
+		const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)&src;
+		memcpy(dest->addr.ipv6.as.bytes, &sin6->sin6_addr, 16);
+		dest->port = sin6->sin6_port;
+	}
 }
 
 uint64_t get_varint(const uint8_t *buf, uint8_t *outsize) {
@@ -112,8 +119,8 @@ vector<uint8_t> get_inv(const vector<inv_vector> &v) {
 }
 
 struct combined_version get_version(const string &user_agent,
-                                    const struct sockaddr_in &from_addr,
-                                    const struct sockaddr_in &recv_addr) {
+                                    const struct sockaddr_storage &from_addr,
+                                    const struct sockaddr_storage &recv_addr) {
 	static const libconfig::Config *cfg(get_config());
 
 

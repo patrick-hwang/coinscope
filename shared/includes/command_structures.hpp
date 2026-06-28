@@ -26,6 +26,18 @@ enum message_types {
 	CONNECT = 4,
 };
 
+/* Address family constants for wire protocol */
+const uint8_t ADDR_FAMILY_IPV4 = 4;
+const uint8_t ADDR_FAMILY_IPV6 = 6;
+const uint8_t ADDR_FAMILY_ONION = 10; /* .onion via Tor */
+
+/* Fixed-size wire address: up to 16 bytes of address + 2 bytes port */
+struct wire_addr {
+	uint8_t family;       /* ADDR_FAMILY_IPV4, ADDR_FAMILY_IPV6, or ADDR_FAMILY_ONION */
+	uint8_t addr[16];     /* 4 bytes for IPv4, 16 for IPv6/onion, zero-padded */
+	uint16_t port;        /* network byte order */
+} __attribute__((packed));
+
 struct message {
 	uint8_t version; 
 	uint32_t length; /* sizeof(payload) */
@@ -37,14 +49,14 @@ struct message {
 typedef message register_msg; 
 
 struct connect_payload { 
-	struct sockaddr_in remote_addr;
-	struct sockaddr_in local_addr;  /* see comment in command_handler. setting this currently does nothing */
+	struct wire_addr remote_addr;
+	struct wire_addr local_addr;
 }__attribute__((packed));
 
-struct connection_info { /* response to COMMAND_GET_CXN && part of response for CONNECT command */
+struct connection_info {
 	uint32_t handle_id;
-	struct sockaddr_in remote_addr;
-	struct sockaddr_in local_addr;
+	struct wire_addr remote_addr;
+	struct wire_addr local_addr;
 } __attribute__((packed));
 
 
@@ -64,6 +76,6 @@ struct command_msg {
 */
 
 
-};
+}
 
 #endif

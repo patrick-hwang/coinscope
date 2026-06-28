@@ -11,18 +11,17 @@ struct randmaker32 nonce_gen32;
 
 unique_ptr<unsigned char[]> sha256(const uint8_t *data, size_t len) {
 
-	EVP_MD_CTX mdctx;
-	EVP_MD_CTX_init(&mdctx);
+	EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
 
 	const EVP_MD *md = EVP_sha256();
 
 	unique_ptr<unsigned char[]> rv(new unsigned char[EVP_MD_size(md)]);
 
-	EVP_DigestInit_ex(&mdctx, md, NULL);
-	EVP_DigestUpdate(&mdctx, data, len);
-	EVP_DigestFinal_ex(&mdctx, rv.get(), NULL);
+	EVP_DigestInit_ex(mdctx, md, NULL);
+	EVP_DigestUpdate(mdctx, data, len);
+	EVP_DigestFinal_ex(mdctx, rv.get(), NULL);
 
-	EVP_MD_CTX_cleanup(&mdctx);
+	EVP_MD_CTX_free(mdctx);
    
 	return rv;
    

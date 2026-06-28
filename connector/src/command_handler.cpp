@@ -4,6 +4,8 @@
 #include <map>
 #include <algorithm>
 #include <functional>
+#include <cstring>
+#include <strings.h>
 
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -29,6 +31,37 @@ int32_t g_active_descriptors(0);
 
 uint32_t handler::id_pool = 0;
 
+/* Helper: convert sockaddr_storage to wire_addr */
+static void sockaddr_to_wire(const struct sockaddr_storage &ss, struct wire_addr &wa) {
+	bzero(&wa, sizeof(wa));
+	if (ss.ss_family == AF_INET) {
+		const struct sockaddr_in *sin = (const struct sockaddr_in *)&ss;
+		wa.family = ADDR_FAMILY_IPV4;
+		memcpy(wa.addr, &sin->sin_addr.s_addr, 4);
+		wa.port = sin->sin_port;
+	} else if (ss.ss_family == AF_INET6) {
+		const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)&ss;
+		wa.family = ADDR_FAMILY_IPV6;
+		memcpy(wa.addr, &sin6->sin6_addr, 16);
+		wa.port = sin6->sin6_port;
+	}
+}
+
+/* Helper: convert wire_addr to sockaddr_storage */
+static void wire_to_sockaddr(const struct wire_addr &wa, struct sockaddr_storage &ss) {
+	bzero(&ss, sizeof(ss));
+	if (wa.family == ADDR_FAMILY_IPV4) {
+		struct sockaddr_in *sin = (struct sockaddr_in *)&ss;
+		sin->sin_family = AF_INET;
+		memcpy(&sin->sin_addr.s_addr, wa.addr, 4);
+		sin->sin_port = wa.port;
+	} else if (wa.family == ADDR_FAMILY_IPV6 || wa.family == ADDR_FAMILY_ONION) {
+		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ss;
+		sin6->sin6_family = AF_INET6;
+		memcpy(&sin6->sin6_addr, wa.addr, 16);
+		sin6->sin6_port = wa.port;
+	}
+}
 
 class registered_msg {
 public:
@@ -83,13 +116,9 @@ void handler::handle_message_recv(const struct command_msg *msg) {
 
 	if (msg->command == COMMAND_GET_CXN) {
 		g_log<CTRL>("All connections requested", regid);
-		/* format is struct connection_info */
 
 		wrapped_buffer<uint8_t> buffer;
 		buffer.realloc(sizeof(uint32_t) + bc::g_active_handlers.size() * sizeof(struct connection_info));
-		/* I could append these piecemeal to the write_queue, but this would cause more allocations/gc. This does it as one big chunk in the list,
-		   which for an active connector should be one mmapped
-		   segment */
 		uint8_t *writebuf = buffer.ptr();
 		uint32_t len = sizeof(struct connection_info) * bc::g_active_handlers.size();
 		len = hton(len);
@@ -97,9 +126,12 @@ void handler::handle_message_recv(const struct command_msg *msg) {
 		writebuf += sizeof(len);
 		for(bc::handler_map::const_iterator it = bc::g_active_handlers.cbegin(); it != bc::g_active_handlers.cend(); ++it) {
 			struct connection_info out;
+			bzero(&out, sizeof(out));
 			out.handle_id = hton(it->first);
-			out.remote_addr = it->second->get_remote_addr();
-			out.local_addr = it->second->get_local_addr();
+			struct sockaddr_storage remote_ss = it->second->get_remote_addr();
+			struct sockaddr_storage local_ss = it->second->get_local_addr();
+			sockaddr_to_wire(remote_ss, out.remote_addr);
+			sockaddr_to_wire(local_ss, out.local_addr);
 			memcpy(writebuf, &out, sizeof(out));
 			writebuf += sizeof(out);
 		}
@@ -206,27 +238,44 @@ void handler::receive_payload() {
 		break;
 	case CONNECT:
 		{
-			/* format is remote packed_net_addr, local packed_net_addr */
-			/* currently local is ignored, but would be used if we bound to more than one interface */
 			struct connect_payload *payload = (struct connect_payload*) msg->payload;
-			g_log<CTRL>("Attempting to connect to", payload->remote_addr, "for", regid);
+			g_log<CTRL>("Attempting to connect to family", (int)payload->remote_addr.family, "for", regid);
 
-			int fd(-1);
-			// TODO: setting local on the client does nothing, but could specify the interface used
-			try {
-				fd = Socket(AF_INET, SOCK_STREAM, 0);
-				fcntl(fd, F_SETFL, O_NONBLOCK);
-			} catch (network_error &e) {
-				if (fd >= 0) {
-					close(fd);
-					fd = -1;
+			struct sockaddr_storage remote_ss;
+			wire_to_sockaddr(payload->remote_addr, remote_ss);
+
+			if (payload->remote_addr.family == ADDR_FAMILY_ONION) {
+				/* Check for extra payload with full hostname */
+				uint32_t extra_len = ntoh(msg->length) - sizeof(struct connect_payload);
+				if (extra_len > 0) {
+					const char *hostname = (const char*)msg->payload + sizeof(struct connect_payload);
+					/* Ensure null-termination for safety */
+					char hostname_buf[64];
+					uint32_t copy_len = min(extra_len, (uint32_t)(sizeof(hostname_buf) - 1));
+					memcpy(hostname_buf, hostname, copy_len);
+					hostname_buf[copy_len] = '\0';
+					new bc::tor_connect_handler(remote_ss, hostname_buf);
+				} else {
+					/* Legacy: reconstruct hostname from 16-byte addr */
+					new bc::tor_connect_handler(remote_ss);
 				}
-				g_log<ERROR>(e.what(), "(command_handler CONNECT)");
-			}
+			} else {
+				int fd(-1);
+				int domain = (remote_ss.ss_family == AF_INET6) ? AF_INET6 : AF_INET;
+				try {
+					fd = Socket(domain, SOCK_STREAM, 0);
+					fcntl(fd, F_SETFL, O_NONBLOCK);
+				} catch (network_error &e) {
+					if (fd >= 0) {
+						close(fd);
+						fd = -1;
+					}
+					g_log<ERROR>(e.what(), "(command_handler CONNECT)");
+				}
 
-			if (fd >= 0) {
-				/* yes, it dangles. It schedules itself for cleanup. yech */
-				new bc::connect_handler(fd, payload->remote_addr); 
+				if (fd >= 0) {
+					new bc::connect_handler(fd, remote_ss);
+				}
 			}
 		}
 		break;

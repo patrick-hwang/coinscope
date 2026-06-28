@@ -47,6 +47,10 @@ inline std::ostream & operator<<(std::ostream &o, const struct sockaddr_in &addr
 	return o << *(struct sockaddr*)&addr;
 }
 
+inline std::ostream & operator<<(std::ostream &o, const struct sockaddr_storage &addr) {
+	return o << *(struct sockaddr*)&addr;
+}
+
 std::string type_to_str(enum log_type type);
 
 /* all logs preceded by a 32 bit network order length prefix */
@@ -190,9 +194,9 @@ void g_log(const std::string &val, Targs... Fargs) {
 template <int N> void g_log(uint32_t id, bool is_sender, const struct bitcoin::packed_message *m);
 template <> void g_log<BITCOIN_MSG>(uint32_t id, bool is_sender, const struct bitcoin::packed_message *m);
 
-template <int N> void g_log(uint32_t update_type, uint32_t handle_id, const struct sockaddr_in &remote, 
-                            const struct sockaddr_in &local, const char * text, uint32_t text_len);
-template <> void g_log<BITCOIN>(uint32_t update_type, uint32_t handle_id, const struct sockaddr_in &remote, 
-                                const struct sockaddr_in &local, const char * text, uint32_t text_len);
+template <int N> void g_log(uint32_t update_type, uint32_t handle_id, const struct sockaddr_storage &remote, 
+                            const struct sockaddr_storage &local, const char * text, uint32_t text_len);
+template <> void g_log<BITCOIN>(uint32_t update_type, uint32_t handle_id, const struct sockaddr_storage &remote, 
+                                const struct sockaddr_storage &local, const char * text, uint32_t text_len);
 
 #endif

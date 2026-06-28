@@ -38,9 +38,9 @@ private:
 
 	write_buffer write_queue; /* application wants this written out across network */
 
-	struct sockaddr_in remote_addr;
+	struct sockaddr_storage remote_addr;
 
-	struct sockaddr_in local_addr; /* address we connected on (TODO) */
+	struct sockaddr_storage local_addr; /* address we connected on (TODO) */
 
 	uint32_t timestamp;
 
@@ -61,15 +61,15 @@ private:
 	}
 
 public:
-	handler(int fd, uint32_t a_state, const struct sockaddr_in &a_remote_addr, const struct sockaddr_in &a_local_addr);
+	handler(int fd, uint32_t a_state, const struct sockaddr_storage &a_remote_addr, const struct sockaddr_storage &a_local_addr);
 	~handler();
 	uint32_t get_id() const { return id; }
 	void handle_message_recv(const struct packed_message *msg);
 	void io_cb(ev::io &watcher, int revents);
 	void pinger_cb(ev::timer &w, int revents);
 	void active_pinger_cb(ev::timer &w, int revents);
-	struct sockaddr_in get_remote_addr() const { return remote_addr; }
-	struct sockaddr_in get_local_addr() const { return local_addr; }
+	struct sockaddr_storage get_remote_addr() const { return remote_addr; }
+	struct sockaddr_storage get_local_addr() const { return local_addr; }
 	/* appends message, leaves write queue unseeked, but increments to_write. */
 	void append_for_write(const struct packed_message *m);
 	void append_for_write(std::unique_ptr<struct packed_message> m);
@@ -113,11 +113,11 @@ extern handler_set g_inactive_handlers;
 class connect_handler { /* for non-blocking connectors */
 public:
 	/* fd should be non-blocking socket. Connect has not been called yet */
-	connect_handler(int fd, const struct sockaddr_in &remote_addr); 
+	connect_handler(int fd, const struct sockaddr_storage &remote_addr); 
 	void io_cb(ev::io &watcher, int revents);
 	~connect_handler();
 private:
-	struct sockaddr_in remote_addr_;
+	struct sockaddr_storage remote_addr_;
 	ev::io io;
 	void setup_handler(int fd);
 	connect_handler & operator=(connect_handler other);
@@ -129,16 +129,56 @@ private:
 
 class accept_handler {
 public:
-	accept_handler(int fd, const struct sockaddr_in &a_local_addr); /* fd should be a listening, non-blocking socket */
+	accept_handler(int fd, const struct sockaddr_storage &a_local_addr); /* fd should be a listening, non-blocking socket */
 	void io_cb(ev::io &watcher, int revents);
 	~accept_handler();
 private:
-	struct sockaddr_in local_addr; /* left in network byte order */
+	struct sockaddr_storage local_addr; /* left in network byte order */
 	ev::io io;
 	accept_handler & operator=(accept_handler other);
 	accept_handler(const accept_handler &);
 	accept_handler(const accept_handler &&other);
 	accept_handler & operator=(accept_handler &&other);
+};
+
+/* Tor SOCKS5 connect handler for .onion addresses */
+class tor_connect_handler {
+public:
+	tor_connect_handler(const struct sockaddr_storage &onion_addr);
+	tor_connect_handler(const struct sockaddr_storage &onion_addr, const char *hostname);
+	void io_cb(ev::io &watcher, int revents);
+	~tor_connect_handler();
+private:
+	enum tor_state {
+		TOR_CONNECT_PROXY,
+		TOR_SEND_GREETING,
+		TOR_RECV_GREETING,
+		TOR_SEND_CONNECT,
+		TOR_RECV_CONNECT,
+		TOR_HANDSHAKE_DONE
+	};
+	struct sockaddr_storage remote_addr_; /* the .onion target address */
+	struct sockaddr_in proxy_addr_;       /* Tor SOCKS5 proxy (127.0.0.1:9050) */
+	ev::io io;
+	int fd_;
+	tor_state state_;
+	char onion_host_[64];
+	uint16_t onion_port_;
+	int written_;
+	int to_write_;
+	void advance();
+	/* Send the SOCKS5 greeting */
+	void send_greeting();
+	/* Parse SOCKS5 greeting response */
+	void recv_greeting();
+	/* Send SOCKS5 connect command */
+	void send_connect();
+	/* Parse SOCKS5 connect response */
+	void recv_connect();
+	tor_connect_handler & operator=(tor_connect_handler other) = delete;
+	tor_connect_handler(const tor_connect_handler &) = delete;
+	tor_connect_handler(const tor_connect_handler &&other) = delete;
+	tor_connect_handler & operator=(tor_connect_handler &&other) = delete;
 };
 
 };

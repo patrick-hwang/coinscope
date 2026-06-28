@@ -155,12 +155,12 @@ struct inv_vector {
 
 std::vector<uint8_t> get_inv(const std::vector<inv_vector> &v);
 
-struct combined_version get_version(const std::string &user_agent, const struct sockaddr_in &from,
-                                    const struct sockaddr_in &recv);
+struct combined_version get_version(const std::string &user_agent, const struct sockaddr_storage &from,
+                                    const struct sockaddr_storage &recv);
 
 std::unique_ptr<struct packed_message> get_message(const char * command, const uint8_t *payload, size_t len);
 inline std::unique_ptr<struct packed_message> get_message(const char * command, 
-                                                                   std::vector<uint8_t> &payload) {
+                                                                    std::vector<uint8_t> &payload) {
 	return get_message(command, payload.data(), payload.size());
 }
 
@@ -174,7 +174,7 @@ uint32_t compute_checksum(const uint8_t *payload, size_t len);
 uint8_t to_varint(uint8_t *buf, uint64_t val);
 uint64_t get_varint(const uint8_t *buf, uint8_t *outsize);
 uint8_t get_varint_size(const uint8_t *bytes);
-void set_address(struct version_packed_net_addr *dest, const struct sockaddr_in &src);
+void set_address(struct version_packed_net_addr *dest, const struct sockaddr_storage &src);
 
 };
 

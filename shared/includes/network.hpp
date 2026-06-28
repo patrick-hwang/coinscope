@@ -3,6 +3,7 @@
 
 #include <endian.h>
 #include <string>
+#include <cstdint>
 
 
 inline int32_t hton(int32_t x) {

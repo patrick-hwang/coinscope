@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <cstdio>
 
 #include "netwrap.hpp"
 #include "logger.hpp"
@@ -30,6 +31,7 @@ static int g_ping_iv = -1;
 static double g_active_ping_iv = -1;
 
 static set<connect_handler *> g_inactive_connection_handlers; /* to be deleted */
+static set<tor_connect_handler *> g_inactive_tor_handlers;
 
 static const string & user_agent() {
 	static bool loaded(false);
@@ -43,9 +45,9 @@ static const string & user_agent() {
 	return agent;
 }
 
-static const sockaddr_in * external_addr() { // This picks an externally bound address at random to broadcast as our external address
+static const struct sockaddr_storage * external_addr() {
 	static bool done(false);
-	static sockaddr_in out;
+	static struct sockaddr_storage out;
 	if (done) {
 		return &out;
 	}
@@ -63,13 +65,24 @@ static const sockaddr_in * external_addr() { // This picks an externally bound a
 	}
 	libconfig::Setting &setting = list[idx];
 	string family((const char*)setting[0]);
-	string ipv4((const char*)setting[1]);
+	string addr_str((const char*)setting[1]);
 	uint16_t port((int)setting[2]);
 	bzero(&out, sizeof(out));
-	out.sin_family = AF_INET;
-	out.sin_port = htons(port);
-	if (inet_pton(AF_INET, ipv4.c_str(), &out.sin_addr) != 1) {
-		g_log<ERROR>("Bad address format on address", idx, strerror(errno));
+
+	if (family == "AF_INET6") {
+		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&out;
+		sin6->sin6_family = AF_INET6;
+		sin6->sin6_port = htons(port);
+		if (inet_pton(AF_INET6, addr_str.c_str(), &sin6->sin6_addr) != 1) {
+			g_log<ERROR>("Bad IPv6 address format on address", idx, strerror(errno));
+		}
+	} else {
+		struct sockaddr_in *sin = (struct sockaddr_in *)&out;
+		sin->sin_family = AF_INET;
+		sin->sin_port = htons(port);
+		if (inet_pton(AF_INET, addr_str.c_str(), &sin->sin_addr) != 1) {
+			g_log<ERROR>("Bad IPv4 address format on address", idx, strerror(errno));
+		}
 	}
 	done = true;
 	return &out;
@@ -91,7 +104,7 @@ static double get_randping() {
 }
 
 
-connect_handler::connect_handler(int fd, const struct sockaddr_in &remote_addr) 
+connect_handler::connect_handler(int fd, const struct sockaddr_storage &remote_addr) 
 	: remote_addr_(remote_addr), io() 
 {
 
@@ -111,7 +124,8 @@ connect_handler::connect_handler(int fd, const struct sockaddr_in &remote_addr)
 		err = bl_emsg;
 	} else {
 		/* first try it */
-		int rv = connect(fd, (struct sockaddr*)&remote_addr_, sizeof(remote_addr_));
+		socklen_t addrlen = (remote_addr_.ss_family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
+		int rv = connect(fd, (struct sockaddr*)&remote_addr_, addrlen);
 		if (rv == 0) {
 			g_log<DEBUG>("No need to do non-blocking connect, setup was instant");
 			setup_handler(fd);
@@ -128,9 +142,9 @@ connect_handler::connect_handler(int fd, const struct sockaddr_in &remote_addr)
 	if (err) { /* oh no, something sad happened */
 		uint32_t len = strlen(err);
 		close(fd);
-		struct sockaddr_in local;
+		struct sockaddr_storage local;
 		bzero(&local, sizeof(local));
-		local.sin_family = AF_INET; /* there is no local connection actually */
+		local.ss_family = remote_addr_.ss_family;
 		g_log<BITCOIN>(CONNECT_FAILURE, 0, remote_addr_, local, err, len+1);
 		g_inactive_connection_handlers.insert(this);
 	}
@@ -139,7 +153,7 @@ connect_handler::connect_handler(int fd, const struct sockaddr_in &remote_addr)
 }
 
 void connect_handler::setup_handler(int fd) { 
-	struct sockaddr_in local;
+	struct sockaddr_storage local;
 	socklen_t len = sizeof(local);
 	bzero(&local,sizeof(local));
 	if (getsockname(fd, (struct sockaddr*) &local, &len) != 0) {
@@ -150,7 +164,8 @@ void connect_handler::setup_handler(int fd) {
 }
 
 void connect_handler::io_cb(ev::io &watcher, int /*revents*/) {
-	int rv = connect(watcher.fd, (struct sockaddr*)&remote_addr_, sizeof(remote_addr_));
+	socklen_t addrlen = (remote_addr_.ss_family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
+	int rv = connect(watcher.fd, (struct sockaddr*)&remote_addr_, addrlen);
 
 	bool is_inactive = false;
 
@@ -168,9 +183,9 @@ void connect_handler::io_cb(ev::io &watcher, int /*revents*/) {
 		io.stop();
 		io.fd = -1;
 		is_inactive = true;
-		struct sockaddr_in local;
+		struct sockaddr_storage local;
 		bzero(&local, sizeof(local));
-		local.sin_family = AF_INET; /* there is no local connection actually */
+		local.ss_family = remote_addr_.ss_family;
 		g_log<BITCOIN>(CONNECT_FAILURE, 0, remote_addr_, local, err, len+1);
 	}
 	
@@ -190,7 +205,7 @@ connect_handler::~connect_handler() {
 }
 
 
-accept_handler::accept_handler(int fd, const struct sockaddr_in &a_local_addr)
+accept_handler::accept_handler(int fd, const struct sockaddr_storage &a_local_addr)
 	: local_addr(a_local_addr), io()
 {
 	g_log<DEBUG>("bitcoin accept initializer initiated, awaiting incoming client connections");
@@ -207,7 +222,7 @@ accept_handler::~accept_handler() {
 }
 
 void accept_handler::io_cb(ev::io &watcher, int /*revents*/) {
-	struct sockaddr_in addr;
+	struct sockaddr_storage addr;
 	socklen_t len(sizeof(addr));
 	int client;
 	try {
@@ -227,7 +242,7 @@ void accept_handler::io_cb(ev::io &watcher, int /*revents*/) {
 		close(client);
 	} else {
 
-		sockaddr_in local;
+		struct sockaddr_storage local;
 		socklen_t socklen = sizeof(local);
 		bzero(&local,sizeof(local));
 		if (getsockname(client, (struct sockaddr*) &local, &socklen) != 0) {
@@ -243,7 +258,7 @@ void accept_handler::io_cb(ev::io &watcher, int /*revents*/) {
 }
 
 
-handler::handler(int fd, uint32_t a_state, const struct sockaddr_in &a_remote_addr, const struct sockaddr_in &a_local_addr) 
+handler::handler(int fd, uint32_t a_state, const struct sockaddr_storage &a_remote_addr, const struct sockaddr_storage &a_local_addr) 
 	: read_queue(0),
 	  write_queue(),
 	  remote_addr(a_remote_addr),
@@ -263,7 +278,7 @@ handler::handler(int fd, uint32_t a_state, const struct sockaddr_in &a_remote_ad
 		io_events = ev::WRITE;
 		io.set(fd, ev::WRITE);
 		/* TODO: profile to see if extra copies are worth optimizing away */
-		const struct sockaddr_in * external = external_addr();
+		const struct sockaddr_storage * external = external_addr();
 		struct combined_version vers(get_version(user_agent(), *external, remote_addr));
 		unique_ptr<struct packed_message> m(get_message("version", vers.as_buffer(), vers.size));
 		g_log<BITCOIN_MSG>(id, true, m.get());
@@ -329,7 +344,7 @@ void handler::active_pinger_cb(ev::timer &/*w*/, int /*revents*/) {
 
 	if (payload[0] == 0) {
 		to_varint(payload, 1);
-		const struct sockaddr_in *external = external_addr();
+		const struct sockaddr_storage *external = external_addr();
 		set_address(&addr->rest, *external);
 	}
 	addr->time = ev::now(ev_default_loop());
@@ -516,7 +531,7 @@ void handler::do_read(ev::io &watcher, int /* revents */) {
 				read_queue.cursor(0);
 				read_queue.to_read(sizeof(struct packed_message));
 					
-				const struct sockaddr_in * external = external_addr();
+				const struct sockaddr_storage * external = external_addr();
 				struct combined_version vers(get_version(user_agent(), remote_addr, *external));
 				unique_ptr<struct packed_message> vmsg(get_message("version", vers.as_buffer(), vers.size));
 
@@ -602,6 +617,259 @@ void handler::io_cb(ev::io &watcher, int revents) {
 	io_set(events);
 
 	last_activity = ev::now(ev_default_loop());
+}
+
+/* Tor SOCKS5 connect handler implementation */
+
+static int create_tor_proxy_socket() {
+	int fd = Socket(AF_INET, SOCK_STREAM, 0);
+	fcntl(fd, F_SETFL, O_NONBLOCK);
+	struct sockaddr_in proxy;
+	bzero(&proxy, sizeof(proxy));
+	proxy.sin_family = AF_INET;
+	proxy.sin_port = htons(9070);
+	inet_pton(AF_INET, "172.20.112.1", &proxy.sin_addr);
+	int rv = connect(fd, (struct sockaddr*)&proxy, sizeof(proxy));
+	if (rv < 0 && errno != EINPROGRESS && errno != EALREADY) {
+		close(fd);
+		throw network_error("tor proxy connect failed", errno);
+	}
+	return fd;
+}
+
+tor_connect_handler::tor_connect_handler(const struct sockaddr_storage &onion_addr)
+	: remote_addr_(onion_addr), proxy_addr_(), io(), fd_(-1), state_(TOR_CONNECT_PROXY),
+	  onion_port_(0), written_(0), to_write_(0)
+{
+	const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)&onion_addr;
+	onion_port_ = ntohs(sin6->sin6_port);
+
+	bzero(onion_host_, sizeof(onion_host_));
+	snprintf(onion_host_, sizeof(onion_host_) - 1,
+	         "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x.onion",
+	         sin6->sin6_addr.s6_addr[0], sin6->sin6_addr.s6_addr[1],
+	         sin6->sin6_addr.s6_addr[2], sin6->sin6_addr.s6_addr[3],
+	         sin6->sin6_addr.s6_addr[4], sin6->sin6_addr.s6_addr[5],
+	         sin6->sin6_addr.s6_addr[6], sin6->sin6_addr.s6_addr[7],
+	         sin6->sin6_addr.s6_addr[8], sin6->sin6_addr.s6_addr[9],
+	         sin6->sin6_addr.s6_addr[10], sin6->sin6_addr.s6_addr[11],
+	         sin6->sin6_addr.s6_addr[12], sin6->sin6_addr.s6_addr[13],
+	         sin6->sin6_addr.s6_addr[14], sin6->sin6_addr.s6_addr[15]);
+
+	for (auto it = g_inactive_tor_handlers.begin(); it != g_inactive_tor_handlers.end(); ++it) {
+		delete *it;
+	}
+	g_inactive_tor_handlers.clear();
+
+	try {
+		fd_ = create_tor_proxy_socket();
+		state_ = TOR_SEND_GREETING;
+		io.set<tor_connect_handler, &tor_connect_handler::io_cb>(this);
+		io.set(fd_, ev::WRITE);
+		io.start();
+	} catch (network_error &e) {
+		g_log<ERROR>("Tor proxy connection failed", e.what());
+		struct sockaddr_storage local;
+		bzero(&local, sizeof(local));
+		local.ss_family = AF_INET6;
+		g_log<BITCOIN>(CONNECT_FAILURE, 0, remote_addr_, local, e.what(), strlen(e.what()) + 1);
+		g_inactive_tor_handlers.insert(this);
+	}
+}
+
+tor_connect_handler::tor_connect_handler(const struct sockaddr_storage &onion_addr, const char *hostname)
+	: remote_addr_(onion_addr), proxy_addr_(), io(), fd_(-1), state_(TOR_CONNECT_PROXY),
+	  onion_port_(0), written_(0), to_write_(0)
+{
+	const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)&onion_addr;
+	onion_port_ = ntohs(sin6->sin6_port);
+
+	bzero(onion_host_, sizeof(onion_host_));
+	snprintf(onion_host_, sizeof(onion_host_) - 1, "%s.onion", hostname);
+
+	for (auto it = g_inactive_tor_handlers.begin(); it != g_inactive_tor_handlers.end(); ++it) {
+		delete *it;
+	}
+	g_inactive_tor_handlers.clear();
+
+	try {
+		fd_ = create_tor_proxy_socket();
+		state_ = TOR_SEND_GREETING;
+		io.set<tor_connect_handler, &tor_connect_handler::io_cb>(this);
+		io.set(fd_, ev::WRITE);
+		io.start();
+	} catch (network_error &e) {
+		g_log<ERROR>("Tor proxy connection failed", e.what());
+		struct sockaddr_storage local;
+		bzero(&local, sizeof(local));
+		local.ss_family = AF_INET6;
+		g_log<BITCOIN>(CONNECT_FAILURE, 0, remote_addr_, local, e.what(), strlen(e.what()) + 1);
+		g_inactive_tor_handlers.insert(this);
+	}
+}
+
+tor_connect_handler::~tor_connect_handler() {
+	if (io.fd >= 0) {
+		if (fd_ >= 0 && io.fd != fd_) {
+			close(fd_);
+		}
+		io.stop();
+		if (fd_ == io.fd) {
+			fd_ = -1;
+		}
+	}
+}
+
+void tor_connect_handler::send_greeting() {
+	unsigned char greeting[] = {0x05, 0x01, 0x00};
+	written_ = 0;
+	to_write_ = sizeof(greeting);
+	while (written_ < to_write_) {
+		ssize_t rv = write(fd_, greeting + written_, to_write_ - written_);
+		if (rv > 0) {
+			written_ += rv;
+		} else if (rv < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+			g_log<ERROR>("Tor greeting write failed", strerror(errno));
+			advance();
+			return;
+		} else if (rv < 0) {
+			break;
+		}
+	}
+	if (written_ >= to_write_) {
+		state_ = TOR_RECV_GREETING;
+		io.set(fd_, ev::READ);
+		written_ = 0;
+		to_write_ = 2;
+	}
+}
+
+void tor_connect_handler::recv_greeting() {
+	unsigned char buf[2];
+	ssize_t rv = read(fd_, buf, sizeof(buf));
+	if (rv > 0) {
+		if (buf[0] == 0x05 && buf[1] == 0x00) {
+			state_ = TOR_SEND_CONNECT;
+			io.set(fd_, ev::WRITE);
+		} else {
+			g_log<ERROR>("Tor SOCKS5 greeting rejected", (int)buf[0], (int)buf[1]);
+			advance();
+		}
+	} else if (rv == 0) {
+		g_log<ERROR>("Tor disconnected during greeting");
+		advance();
+	} else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+		g_log<ERROR>("Tor greeting read error", strerror(errno));
+		advance();
+	}
+}
+
+void tor_connect_handler::send_connect() {
+	uint8_t hostlen = strlen(onion_host_);
+	unsigned char buf[6 + hostlen + 2];
+	buf[0] = 0x05;
+	buf[1] = 0x01;
+	buf[2] = 0x00;
+	buf[3] = 0x03;
+	buf[4] = hostlen;
+	memcpy(buf + 5, onion_host_, hostlen);
+	buf[5 + hostlen] = (onion_port_ >> 8) & 0xFF;
+	buf[6 + hostlen] = onion_port_ & 0xFF;
+
+	written_ = 0;
+	to_write_ = sizeof(buf);
+	while (written_ < to_write_) {
+		ssize_t rv = write(fd_, buf + written_, to_write_ - written_);
+		if (rv > 0) {
+			written_ += rv;
+		} else if (rv < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+			g_log<ERROR>("Tor connect write failed", strerror(errno));
+			advance();
+			return;
+		} else if (rv < 0) {
+			break;
+		}
+	}
+	if (written_ >= to_write_) {
+		state_ = TOR_RECV_CONNECT;
+		io.set(fd_, ev::READ);
+		written_ = 0;
+		to_write_ = 4;
+	}
+}
+
+void tor_connect_handler::recv_connect() {
+	unsigned char buf[256];
+	ssize_t rv = read(fd_, buf, sizeof(buf));
+	if (rv > 0) {
+		if (buf[0] == 0x05 && buf[1] == 0x00) {
+			state_ = TOR_HANDSHAKE_DONE;
+			io.stop();
+			fcntl(fd_, F_SETFL, O_NONBLOCK);
+			struct sockaddr_storage local;
+			socklen_t socklen = sizeof(local);
+			bzero(&local, sizeof(local));
+			if (getsockname(fd_, (struct sockaddr*)&local, &socklen) != 0) {
+				g_log<ERROR>(strerror(errno));
+			}
+			unique_ptr<handler> h(new handler(fd_, SEND_VERSION_INIT, remote_addr_, local));
+			g_active_handlers.insert(make_pair(h->get_id(), move(h)));
+			fd_ = -1;
+			advance();
+		} else {
+			g_log<ERROR>("Tor connect rejected, REP:", (int)buf[1]);
+			advance();
+		}
+	} else if (rv == 0) {
+		g_log<ERROR>("Tor disconnected during connect reply");
+		advance();
+	} else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+		g_log<ERROR>("Tor connect read error", strerror(errno));
+		advance();
+	}
+}
+
+void tor_connect_handler::advance() {
+	io.stop();
+	if (fd_ >= 0) {
+		close(fd_);
+		fd_ = -1;
+	}
+	state_ = TOR_CONNECT_PROXY;
+	g_inactive_tor_handlers.insert(this);
+}
+
+void tor_connect_handler::io_cb(ev::io &watcher, int revents) {
+	switch (state_) {
+	case TOR_CONNECT_PROXY:
+		{
+			int err;
+			socklen_t errlen = sizeof(err);
+			if (getsockopt(fd_, SOL_SOCKET, SO_ERROR, (char*)&err, &errlen) == 0 && err == 0) {
+				state_ = TOR_SEND_GREETING;
+			} else if (err != 0) {
+				g_log<ERROR>("Tor proxy connect error", strerror(err));
+				advance();
+				return;
+			}
+			io.set(fd_, ev::WRITE);
+		}
+		break;
+	case TOR_SEND_GREETING:
+		if (revents & ev::WRITE) send_greeting();
+		break;
+	case TOR_RECV_GREETING:
+		if (revents & ev::READ) recv_greeting();
+		break;
+	case TOR_SEND_CONNECT:
+		if (revents & ev::WRITE) send_connect();
+		break;
+	case TOR_RECV_CONNECT:
+		if (revents & ev::READ) recv_connect();
+		break;
+	default:
+		break;
+	}
 }
 
 };

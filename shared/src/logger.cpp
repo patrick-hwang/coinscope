@@ -69,8 +69,8 @@ static void append_buf(wrapped_buffer<uint8_t> &buf, size_t len) {
 }
 
 
-template <> void g_log<BITCOIN>(uint32_t update_type, uint32_t handle_id, const struct sockaddr_in &remote, 
-                                const struct sockaddr_in &local, const char * text, uint32_t text_len) {
+template <> void g_log<BITCOIN>(uint32_t update_type, uint32_t handle_id, const struct sockaddr_storage &remote, 
+                                const struct sockaddr_storage &local, const char * text, uint32_t text_len) {
 	uint64_t net_time = hton((uint64_t)ev::now(ev_default_loop()));
 	size_t len = 1 + sizeof(net_time) + sizeof(handle_id) + sizeof(update_type) +
 		2*sizeof(remote) + sizeof(text_len) + text_len;

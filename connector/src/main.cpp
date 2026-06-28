@@ -64,15 +64,18 @@ static void load_blacklist() {
 		g_blacklist.clear();
 
 		string line;
-		struct sockaddr_in entry;
+		struct sockaddr_storage entry;
 		bzero(&entry, sizeof(entry));
-		entry.sin_family = AF_INET;
 
 		while(getline(file, line)) {
-			if (inet_pton(AF_INET, line.c_str(), &entry.sin_addr) != 1) {
-				g_log<ERROR>("Invalid blacklist entry", line);
-			} else {
+			if (inet_pton(AF_INET, line.c_str(), &((struct sockaddr_in*)&entry)->sin_addr) == 1) {
+				entry.ss_family = AF_INET;
 				g_blacklist.insert(entry);
+			} else if (inet_pton(AF_INET6, line.c_str(), &((struct sockaddr_in6*)&entry)->sin6_addr) == 1) {
+				entry.ss_family = AF_INET6;
+				g_blacklist.insert(entry);
+			} else {
+				g_log<ERROR>("Invalid blacklist entry (not IPv4 or IPv6)", line);
 			}
 		}
 	
@@ -153,42 +156,55 @@ int main(int argc, char *argv[]) {
 	ev::default_loop loop;
 
 
-	vector<unique_ptr<bc::accept_handler> > bc_accept_handlers; /* form is to get around some move semantics with ev::io I don't want to muck it up */
+	vector<unique_ptr<bc::accept_handler> > bc_accept_handlers;
 
 	libconfig::Setting &list = cfg->lookup("connector.bitcoin.listeners");
 	for(int index = 0; index < list.getLength(); ++index) {
 		libconfig::Setting &setting = list[index];
 		string family((const char*)setting[0]);
-		string ipv4((const char*)setting[1]);
+		string addr_str((const char*)setting[1]);
 		uint16_t port((int)setting[2]);
 		int backlog(setting[3]);
 
-		g_log<DEBUG>("Attempting to instantiate listener on ", family, 
-		               ipv4, port, "with backlog", backlog);
+		g_log<DEBUG>("Attempting to instantiate listener on ", family,
+		               addr_str, port, "with backlog", backlog);
 
-		if (family != "AF_INET") {
-			g_log<ERROR>("Family", family, "not supported. Skipping");
-			continue;
-		}
-
-		struct sockaddr_in bitcoin_addr;
+		struct sockaddr_storage bitcoin_addr;
 		bzero(&bitcoin_addr, sizeof(bitcoin_addr));
-		bitcoin_addr.sin_family = AF_INET;
-		bitcoin_addr.sin_port = htons(port);
-		if (inet_pton(AF_INET, ipv4.c_str(), &bitcoin_addr.sin_addr) != 1) {
-			g_log<ERROR>("Bad address format on address", index, strerror(errno));
-			continue;
+		int domain;
+		socklen_t addrlen;
+
+		if (family == "AF_INET6") {
+			struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&bitcoin_addr;
+			sin6->sin6_family = AF_INET6;
+			sin6->sin6_port = htons(port);
+			sin6->sin6_addr = in6addr_any;
+			domain = AF_INET6;
+			addrlen = sizeof(*sin6);
+			if (inet_pton(AF_INET6, addr_str.c_str(), &sin6->sin6_addr) != 1) {
+				g_log<ERROR>("Bad IPv6 address format on address", index, strerror(errno));
+				continue;
+			}
+			sin6->sin6_addr = in6addr_any;
+		} else {
+			struct sockaddr_in *sin = (struct sockaddr_in *)&bitcoin_addr;
+			sin->sin_family = AF_INET;
+			sin->sin_port = htons(port);
+			sin->sin_addr.s_addr = INADDR_ANY;
+			domain = AF_INET;
+			addrlen = sizeof(*sin);
+			if (inet_pton(AF_INET, addr_str.c_str(), &sin->sin_addr) != 1) {
+				g_log<ERROR>("Bad IPv4 address format on address", index, strerror(errno));
+				continue;
+			}
+			sin->sin_addr.s_addr = INADDR_ANY;
 		}
 
-		/* TEMPORARY HACK!!!! This is because on EC2 the local interface is not the same as the public interface */
-		bitcoin_addr.sin_addr.s_addr = INADDR_ANY;
-
-
-		int bitcoin_sock = Socket(AF_INET, SOCK_STREAM, 0);
+		int bitcoin_sock = Socket(domain, SOCK_STREAM, 0);
 		fcntl(bitcoin_sock, F_SETFL, O_NONBLOCK);
 		int optval = 1;
 		setsockopt(bitcoin_sock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
-		Bind(bitcoin_sock, (struct sockaddr*)&bitcoin_addr, sizeof(bitcoin_addr));
+		Bind(bitcoin_sock, (struct sockaddr*)&bitcoin_addr, addrlen);
 		Listen(bitcoin_sock, backlog);
 
 		bc_accept_handlers.emplace_back(new bc::accept_handler(bitcoin_sock, bitcoin_addr));
